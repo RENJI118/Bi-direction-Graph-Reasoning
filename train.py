@@ -7,7 +7,7 @@ import warnings
 
 import numpy as np
 from tqdm import tqdm
-
+from thop import profile
 from sklearn.model_selection import train_test_split
 import joblib
 
@@ -32,15 +32,15 @@ arch_names = list(unet.__dict__.keys())
 loss_names = list(loss.__dict__.keys())
 loss_names.append('BCEWithLogitsLoss')
 
-IMG_PATH = glob("")
-MASK_PATH = glob("")
+IMG_PATH = glob("/root/autodl-tmp/data-brats/outputImg/*.npy")
+MASK_PATH = glob("/root/autodl-tmp/data-brats/outputMask/*.npy")
 
 def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--name', default='model',
                         help='model name: (default: arch+timestamp)')
-    parser.add_argument('--arch', '-a', metavar='ARCH', default='ACMINet',
+    parser.add_argument('--arch', '-a', metavar='ARCH', default='model',
                         choices=arch_names,
                         help='model architecture: ' +
                             ' | '.join(arch_names) +
@@ -56,7 +56,7 @@ def parse_args():
                         help='loss: ' +
                             ' | '.join(loss_names) +
                             ' (default: BCEDiceLoss)')
-    parser.add_argument('--epochs', default=10000, type=int, metavar='N',
+    parser.add_argument('--epochs', default=100, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('--early-stop', default=20, type=int,
                         metavar='N', help='early stopping (default: 20)')
@@ -106,9 +106,9 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
-def train(args, train_loader, model, optimizer, epoch, scheduler=None):
+def train(args, train_loader, model, criterion, optimizer, epoch):
     losses = AverageMeter()
-    ious = AverageMeter()
+    dices_s = AverageMeter()
 
     model.train()
 
@@ -121,62 +121,83 @@ def train(args, train_loader, model, optimizer, epoch, scheduler=None):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         input, target = input.to(device), target.to(device)
         
+        # flops, params = profile(model, inputs=(input,))
+        # print(f"Model FLOPs: {flops / 1e9:.2f} GFLOPs")  # 转换为 Giga FLOPs
+        # print(f"Model Parameters: {params / 1e6:.2f} M")  # 转换为 Million
+        
 
         region, out_region,out_contour = model(input)
 
 
         # compute output
-        criterion=BCEDiceLoss()
         loss_region = criterion(out_region, target)
         loss_contour =Cross_entropy_loss(out_contour, target)
-        loss_fusion = criterion(region, target) + Cross_entropy_loss(contour, target)
+        loss_fusion = criterion(region, target) 
 
         # compute gradient and do optimizing step
         optimizer.zero_grad()
         total_loss = loss_contour + loss_region + loss_fusion
-        # total_loss = loss_contour + loss_region  
         total_loss.backward()
-        # iou=iou_score(region, target)
-        iou=iou_score(out_contour, target)
+        dice = dice_coef(region, target)
         optimizer.step()
 
-        # losses.update(loss_contour.item(),loss_region.item(), loss_fusion.item(), input.size(0))
-        losses.update(loss_region.item(), input.size(0))
-        ious.update(iou, input.size(0))
+        losses.update(total_loss.item(), input.size(0))
         
-
-        if args.deepsupervision:
-            outputs = model(input)
-            loss = 0
-            for output in outputs:
-                loss += criterion(output, target)
-            loss /= len(outputs)
-            iou = iou_score(outputs[-1], target)
-        else:
-            output = model(input)
-            loss = criterion(output, target)
-            iou = iou_score(output, target)
-
-        losses.update(loss.item(), input.size(0))
-        ious.update(iou, input.size(0))
-
+        dices_s.update(torch.tensor(dice), input.size(0))
+     
 
 
     log = OrderedDict([
-        ('loss', losses.avg),
-        ('iou', ious.avg),
+        ('loss', losses.avg)
     ])
 
     return log
 
 
+def validate(args, val_loader, model, criterion):
+    losses = AverageMeter()
+    dices_s = AverageMeter()
+
+
+    # switch to evaluate mode
+    model.eval()
+
+    for i, (input, target) in tqdm(enumerate(val_loader), total=len(val_loader)):
+
+        input = input.cuda()
+        target = target.cuda()
+        
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        input, target = input.to(device), target.to(device)
+        
+
+        region, out_region,out_contour = model(input)
+
+        # compute output
+        loss_region = criterion(out_region, target)
+        loss_contour =Cross_entropy_loss(out_contour, target)
+        loss_fusion = criterion(region, target) 
+
+        # compute gradient and do optimizing step
+        total_loss = loss_contour + loss_region + loss_fusion
+        total_loss.backward()
+        
+
+        # iou=iou_score(out_contour, target)
+        dice = dice_coef(region, target)
+   
+
+        losses.update(total_loss.item(), input.size(0))
+        dices_s.update(torch.tensor(dice), input.size(0))
+        
+
 
     log = OrderedDict([
-        ('loss', losses.avg),
-        ('iou', ious.avg),
-        ('val_dice', val_dice),
+        ('loss', losses.avg)
     ])
 
+   
     return log
 
 
@@ -202,7 +223,8 @@ def main():
             
 
     joblib.dump(args, 'models/%s/args.pkl' %args.name)
-
+    
+    criterion=BCEDiceLoss().cuda()
 
     cudnn.benchmark = True
 
@@ -210,10 +232,9 @@ def main():
     img_paths = IMG_PATH
     mask_paths = MASK_PATH
 
+
     train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = \
             train_test_split(img_paths, mask_paths, test_size=0.2, random_state=41)
-    print("train_num:%s"%str(len(train_img_paths)))
-    print("val_num:%s"%str(len(val_img_paths)))
 
     # create model
     print("=> creating model %s" % args.arch)
@@ -262,11 +283,60 @@ def main():
         drop_last=False)
 
     log = pd.DataFrame(index=[], columns=[
-        'epoch', 'lr', 'loss', 'iou', 'val_loss', 'val_iou'
+        'epoch', 'lr', 'loss', 'val_loss'
     ])
 
 
     torch.cuda.empty_cache()
+    
+    best_loss = 100
+    best_iou = 0
+    trigger = 0
+
+    for epoch in range(args.epochs):
+        print('Epoch [%d/%d]' %(epoch, args.epochs))
+        # train for one epoch
+        train_log = train(args, train_loader, model, criterion, optimizer, epoch)
+
+        # scheduler.step()
+        # evaluate on validation set
+        val_log = validate(args, val_loader, model, criterion)
+
+        # print('loss %.4f - iou %.4f - dice_1 %.4f - dice_2 %.4f - val_loss %.4f - val_iou %.4f - val_dice_1 %.4f - val_dice_2 %.4f'
+        #           %(train_log['loss'],train_log['dice_1'], train_log['dice_2'], val_log['loss'], val_log['dice_1'], val_log['dice_2']))
+
+        # print('loss %.4f - iou %.4f - dice %.4f ' %(train_log['loss'], train_log['iou'], train_log['dice']))
+        print('loss %.4f - val_loss %.4f 
+              % (train_log['loss'], val_log['loss']))
+
+
+        tmp = pd.Series([
+            epoch,
+            args.lr,
+            train_log['loss'],
+            val_log['loss'],
+        ], index=['epoch', 'lr', 'loss', 'val_loss''])
+
+        log = pd.concat([log, tmp], ignore_index=True)
+        log.to_csv('models/{}/{}/log.csv'.format(args.name,timestamp), index=False)
+        
+
+        trigger += 1
+
+        val_loss = val_log['loss']
+        # if val_loss < best_loss:
+        torch.save(model.state_dict(), 'models/%s/model.pth' % args.name)
+        best_loss = val_loss
+        print("=> saved best model")
+        trigger = 0
+
+        # early stopping
+        if not args.early_stop is None:
+            if trigger >= args.early_stop:
+                print("=> early stopping")
+                break
+
+        torch.cuda.empty_cache()
     
 
 
